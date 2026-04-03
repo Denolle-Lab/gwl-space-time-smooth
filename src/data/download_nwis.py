@@ -1,8 +1,19 @@
 """
 Download USGS NWIS groundwater level data for CONUS.
 
-Pulls groundwater levels and site metadata state-by-state using the
-`dataretrieval` package, with checkpointing so interrupted runs can resume.
+Pulls groundwater levels state-by-state using the USGS Water Data OGC API
+(https://api.waterdata.usgs.gov/ogcapi/v0/), with checkpointing so interrupted
+runs can resume.  Site metadata is fetched via dataretrieval.nwis.get_info()
+which still uses the supported /site endpoint.
+
+The legacy /nwis/gwlevels/ endpoint was decommissioned on 2026-02-01 and now
+returns an HTML redirect.  This script replaces the broken dataretrieval
+get_gwlevels() call with a direct paginated call to:
+  https://api.waterdata.usgs.gov/ogcapi/v0/collections/field-measurements/items
+filtered by parameter_code=72019 (depth-to-water below land surface, ft).
+
+Set environment variable USGS_API_KEY to avoid anonymous rate-limit throttling.
+Sign up for a free key at https://api.waterdata.usgs.gov/signup/.
 
 Usage:
     python -m src.data.download_nwis --start-date 2000-01-01 --output-dir data/raw/nwis
@@ -18,12 +29,14 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 import dataretrieval.nwis as nwis
 import pandas as pd
+import requests
 from tqdm import tqdm
 
 logging.basicConfig(
@@ -46,9 +59,55 @@ CONUS_STATES: dict[str, str] = {
     "WV": "54", "WI": "55", "WY": "56", "DC": "11",
 }
 
+# New USGS Water Data OGC API base URL
+_OGC_BASE = "https://api.waterdata.usgs.gov/ogcapi/v0/collections"
+_FM_ITEMS = f"{_OGC_BASE}/field-measurements/items"
+
+# USGS groundwater level parameter code (depth to water, ft below land surface)
+_GW_PARAM_CODE = "72019"
+
+# Sites per HTTP request to the OGC API (keep URL short enough for GET)
+_SITE_BATCH = 50
+
+# Records returned per page
+_PAGE_SIZE = 1000
+
 # Maximum retries per state on transient API failures
 MAX_RETRIES = 3
 RETRY_DELAY_SEC = 30
+
+# Map new API qualifier strings → legacy lev_status_cd single-letter codes.
+# Keys are lower-cased versions of qualifier values returned by the OGC API.
+# Values of "" mean "valid/static" and are kept by qc_nwis.py's filter.
+_QUALIFIER_TO_STATUS: dict[str, str] = {
+    "static": "",
+    "pumping": "P",
+    "dry": "D",
+    "flowing": "F",
+    "obstructed": "O",
+    "recently pumped": "R",
+    "recently flowing nearby": "E",
+    "nearby recently flowing": "G",
+    "injecting": "I",
+    "discontinued": "N",
+    "foreign substance": "V",
+    "other": "Z",
+}
+
+
+def _qualifiers_to_status(qualifiers: list[str] | None) -> str:
+    """
+    Convert a list of OGC API qualifier strings to a single lev_status_cd letter.
+
+    Returns the first non-blank mapped code found, or "" if all are "Static"/unknown.
+    """
+    if not qualifiers:
+        return ""
+    for q in qualifiers:
+        code = _QUALIFIER_TO_STATUS.get(q.lower(), "")
+        if code:
+            return code
+    return ""
 
 
 def load_checkpoint(log_path: Path) -> dict:
@@ -66,6 +125,88 @@ def save_checkpoint(log_path: Path, log: dict) -> None:
         json.dump(log, f, indent=2)
 
 
+def _fetch_gw_levels_for_sites(
+    site_nos: list[str],
+    start_date: str,
+    session: requests.Session,
+    api_key: str | None,
+) -> list[dict]:
+    """
+    Paginate through OGC field-measurements for a list of site numbers.
+
+    Parameters
+    ----------
+    site_nos:
+        USGS site numbers (without "USGS-" prefix).
+    start_date:
+        ISO date string, e.g. "2001-01-01".  Fetches from this date to present.
+    session:
+        Shared requests.Session for connection pooling.
+    api_key:
+        Optional USGS API key for higher rate limits.
+
+    Returns
+    -------
+    list of record dicts compatible with the legacy *_gwlevels.parquet schema.
+    """
+    monitoring_ids = ",".join(f"USGS-{s}" for s in site_nos)
+    base_params: dict[str, str] = {
+        "f": "json",
+        "monitoring_location_id": monitoring_ids,
+        "parameter_code": _GW_PARAM_CODE,
+        "datetime": f"{start_date}/..",
+        "limit": str(_PAGE_SIZE),
+    }
+    if api_key:
+        base_params["api_key"] = api_key
+
+    records: list[dict] = []
+    url: str | None = _FM_ITEMS
+    params: dict | None = base_params
+
+    while url is not None:
+        resp = session.get(url, params=params, timeout=120)
+        resp.raise_for_status()
+        payload = resp.json()
+
+        for feat in payload.get("features", []):
+            props = feat["properties"]
+            # Extract site_no by stripping "USGS-" agency prefix
+            mon_id: str = props.get("monitoring_location_id", "")
+            site_no = mon_id.split("-", 1)[1] if "-" in mon_id else mon_id
+
+            # Geometry coordinates (lon, lat)
+            coords = (feat.get("geometry") or {}).get("coordinates")
+            lat = coords[1] if coords else None
+            lon = coords[0] if coords else None
+
+            records.append({
+                "site_no": site_no,
+                "agency_cd": mon_id.split("-")[0] if "-" in mon_id else "USGS",
+                "lev_dt": props.get("time", "")[:10],      # date portion of ISO timestamp
+                "lev_tm": props.get("time", "")[11:19],     # time portion HH:MM:SS
+                "lev_tz_cd": "UTC",
+                "lev_va": props.get("value"),               # depth, ft (str → float in QC)
+                "lev_status_cd": _qualifiers_to_status(props.get("qualifier")),
+                "lev_meth_cd": props.get("observing_procedure_code"),
+                "lev_unit_cd": props.get("unit_of_measure", "ft"),
+                "vertical_datum": props.get("vertical_datum"),
+                "approval_status": props.get("approval_status"),
+                "lat": lat,
+                "lon": lon,
+            })
+
+        # Follow pagination "next" link; clear params (URL is fully qualified)
+        url = None
+        params = None
+        for lnk in payload.get("links", []):
+            if lnk.get("rel") == "next":
+                url = lnk["href"]
+                break
+
+    return records
+
+
 def download_state_gwlevels(
     state_abbr: str,
     state_fips: str,
@@ -75,37 +216,17 @@ def download_state_gwlevels(
     """
     Download groundwater levels + site metadata for one state.
 
+    GW levels are fetched from the USGS Water Data OGC API
+    (field-measurements collection, parameter_code=72019).
+    Site metadata is fetched via dataretrieval.nwis.get_info().
+
     Returns a summary dict with record counts and status.
     """
     gw_path = output_dir / f"{state_abbr}_gwlevels.parquet"
     sites_path = output_dir / f"{state_abbr}_sites.parquet"
+    api_key: str | None = os.environ.get("USGS_API_KEY")
 
-    # --- Groundwater levels ---
-    logger.info(f"  Downloading GW levels for {state_abbr} (FIPS {state_fips})...")
-    try:
-        df_gw, _ = nwis.get_gwlevels(
-            stateCd=state_fips,
-            startDT=start_date,
-        )
-    except Exception as e:
-        # dataretrieval returns empty DataFrame on "no data" — but may also
-        # raise on genuine API errors
-        logger.warning(f"  get_gwlevels failed for {state_abbr}: {e}")
-        df_gw = pd.DataFrame()
-
-    n_levels = len(df_gw)
-    if n_levels > 0:
-        # Reset multi-index that dataretrieval sometimes returns
-        if isinstance(df_gw.index, pd.MultiIndex):
-            df_gw = df_gw.reset_index()
-        elif df_gw.index.name:
-            df_gw = df_gw.reset_index()
-        df_gw.to_parquet(gw_path, index=False)
-        logger.info(f"  → {n_levels:,} GW level records saved to {gw_path.name}")
-    else:
-        logger.info(f"  → No GW level records for {state_abbr}")
-
-    # --- Site metadata (expanded) ---
+    # --- Site metadata (dataretrieval /site endpoint, still supported) ---
     logger.info(f"  Downloading site metadata for {state_abbr}...")
     try:
         df_sites, _ = nwis.get_info(
@@ -128,6 +249,44 @@ def download_state_gwlevels(
         logger.info(f"  → {n_sites:,} GW sites saved to {sites_path.name}")
     else:
         logger.info(f"  → No GW site metadata for {state_abbr}")
+
+    # --- Groundwater levels (OGC field-measurements API) ---
+    logger.info(f"  Downloading GW levels for {state_abbr} (FIPS {state_fips})...")
+
+    # Use existing sites file (just downloaded or from a previous run) to get
+    # the list of site numbers to query.
+    if sites_path.exists():
+        site_nos = pd.read_parquet(sites_path, columns=["site_no"])["site_no"].astype(str).tolist()
+    else:
+        logger.warning(f"  No sites file for {state_abbr} — skipping GW level download")
+        return {"n_levels": 0, "n_sites": n_sites, "timestamp": datetime.now(timezone.utc).isoformat()}
+
+    all_records: list[dict] = []
+    n_batches = (len(site_nos) + _SITE_BATCH - 1) // _SITE_BATCH
+
+    with requests.Session() as session:
+        session.headers.update({"Accept": "application/geo+json"})
+        for batch_idx in range(n_batches):
+            batch = site_nos[batch_idx * _SITE_BATCH: (batch_idx + 1) * _SITE_BATCH]
+            try:
+                recs = _fetch_gw_levels_for_sites(batch, start_date, session, api_key)
+                all_records.extend(recs)
+            except requests.HTTPError as e:
+                logger.warning(f"  HTTP error on batch {batch_idx + 1}/{n_batches}: {e}")
+            except Exception as e:
+                logger.warning(f"  Error on batch {batch_idx + 1}/{n_batches}: {e}")
+            # Polite delay between batches to respect API rate limits
+            if batch_idx < n_batches - 1:
+                time.sleep(1)
+
+    n_levels = len(all_records)
+    if n_levels > 0:
+        df_gw = pd.DataFrame(all_records)
+        df_gw["lev_va"] = pd.to_numeric(df_gw["lev_va"], errors="coerce")
+        df_gw.to_parquet(gw_path, index=False)
+        logger.info(f"  → {n_levels:,} GW level records saved to {gw_path.name}")
+    else:
+        logger.info(f"  → No GW level records for {state_abbr}")
 
     return {
         "n_levels": n_levels,

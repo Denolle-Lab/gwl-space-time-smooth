@@ -2,54 +2,78 @@
 
 ## USGS NWIS Groundwater Levels
 
-**REST API base URL**: `https://waterservices.usgs.gov/nwis/gwlevels/`
+> **⚠️ API MIGRATION (2026-02-01)**: The legacy `/nwis/gwlevels/` endpoint was
+> decommissioned on 2026-02-01 and now returns an HTML redirect. Use the new
+> OGC API endpoint below instead. `dataretrieval.nwis.get_gwlevels()` is **broken**.
+
+### New OGC API (field-measurements)
+
+**Items endpoint**: `https://api.waterdata.usgs.gov/ogcapi/v0/collections/field-measurements/items`
 
 Key query parameters:
 | Parameter | Value | Notes |
 |-----------|-------|-------|
-| `stateCd` | e.g., `CA` | One state per request |
-| `siteType` | `GW` | Groundwater only |
-| `startDT` | `2000-01-01` | GRACE era start |
-| `format` | `rdb` or `json` | rdb is tab-delimited, easier to parse |
+| `monitoring_location_id` | `USGS-{site_no},...` | Comma-separated list, up to ~50 at once |
+| `parameter_code` | `72019` | Depth to water level, ft below land surface |
+| `datetime` | `2000-01-01/..` | RFC3339 interval; `..` means open end |
+| `limit` | `1000` | Records per page (max) |
+| `f` | `json` | Always set for programmatic access |
+| `api_key` | from env var | Required for >few requests/hr; free signup at https://api.waterdata.usgs.gov/signup/ |
 
-**Python wrapper** (preferred): `dataretrieval` (in `pixi.toml`)
+**Response format**: GeoJSON FeatureCollection; paginate via `"rel": "next"` link.
+
+**Critical fields in `feature.properties`**:
+| New field | Old field | Notes |
+|-----------|-----------|-------|
+| `monitoring_location_id` | `site_no` | Strip `"USGS-"` prefix to get site number |
+| `time` | `lev_dt` + `lev_tm` | ISO8601 with timezone; slice `[:10]` for date |
+| `value` | `lev_va` | Depth in feet (string → coerce to float) |
+| `qualifier` | `lev_status_cd` | Array of strings; see mapping table below |
+| `unit_of_measure` | `lev_unit_cd` | Usually `"ft"` |
+| `observing_procedure_code` | `lev_meth_cd` | Method code (T=tape, R=recorder, etc.) |
+| `vertical_datum` | (was in sites) | Vertical datum name string |
+| `approval_status` | — | `"Approved"` or `"Provisional"` |
+| `geometry.coordinates` | `dec_long_va`, `dec_lat_va` | [lon, lat] in EPSG:4326 |
+
+**Qualifier → lev_status_cd mapping**:
+| New qualifier string | Old code | Action |
+|---------------------|----------|--------|
+| `"Static"` | `""` (blank) | **Keep** |
+| `"Pumping"` | `"P"` | Drop |
+| `"Dry"` | `"D"` | Drop |
+| `"Flowing"` | `"F"` | Drop |
+| `"Obstructed"` | `"O"` | Drop |
+| `"Recently pumped"` | `"R"` | Drop |
+| `"Other"` | `"Z"` | Drop |
+
+**Site metadata**: Still uses `dataretrieval.nwis.get_info()` (working as of 2026)
 ```python
 import dataretrieval.nwis as nwis
-data, meta = nwis.get_gwlevels(stateCd="CA", startDT="2000-01-01")
+sites, meta = nwis.get_info(stateCd="10", siteType="GW", siteOutput="expanded", hasDataTypeCd="gw")
 ```
 
-**Site metadata**: `https://waterservices.usgs.gov/nwis/site/`
-```python
-sites, meta = nwis.get_info(stateCd="CA", siteType="GW")
+**Set API key** (recommended for bulk downloads):
+```bash
+export USGS_API_KEY="your_key_here"
 ```
+Then `download_nwis.py` will pick it up automatically via `os.environ.get("USGS_API_KEY")`.
 
-### Critical Fields
+**Documentation**:
+- OGC API overview: `https://api.waterdata.usgs.gov/docs/ogcapi/`
+- Migration guide: `https://api.waterdata.usgs.gov/docs/ogcapi/migration`
+- OpenAPI/Swagger: `https://api.waterdata.usgs.gov/ogcapi/v0/openapi`
+
+### Site Metadata Fields (from `dataretrieval.nwis.get_info()`, unchanged)
 
 | Field | Description | Notes |
 |-------|-------------|-------|
 | `site_no` | USGS site number | 8–15 digit string; use as string, not int |
 | `dec_lat_va` | Decimal latitude (NAD83) | |
 | `dec_long_va` | Decimal longitude (NAD83) | |
-| `lev_dt` | Measurement date | Parse as UTC |
-| `lev_va` | Water level below land surface (feet) | Convert to meters on ingest |
-| `lev_status_cd` | Measurement status | See status code table below |
 | `well_depth_va` | Well depth (feet) | Flag > 500 ft as likely confined |
-| `alt_va` | Land surface altitude (feet, NAVD88) | Convert to meters; use for WTE = alt_va_m − lev_va_m |
+| `alt_va` | Land surface altitude (feet, NAVD88) | Convert to meters; WTE = alt_va_m − dtw_m |
 | `alt_datum_cd` | Vertical datum | Must be NAVD88; flag/exclude NGVD29 |
 | `aquifer_cd` | Aquifer code | Useful categorical covariate |
-
-### `lev_status_cd` Values to Filter Out
-
-| Code | Meaning |
-|------|---------|
-| `P` | Affected by pumping |
-| `D` | Dry |
-| `O` | Obstructed |
-| `X` | Measurement failed |
-| `F` | Frozen |
-| `E` | Estimated |
-| `R` | Revegetating (recovery) |
-| Blank | Routine static measurement — **keep** |
 
 ---
 
