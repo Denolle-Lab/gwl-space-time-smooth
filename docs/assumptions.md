@@ -11,7 +11,7 @@ is revisited. Each entry is tagged with impact severity and a mitigation strateg
 | A2 | Confined and unconfined aquifers are not distinguished in the spatial model | High | Filter wells with `well_depth_va` > 150 m (500 ft); add aquifer type code as categorical covariate where available |
 | A3 | `lev_status_cd` blank entries are assumed to be valid static measurements | Low | Conservative — blank is the most common code for routine measurements |
 | A4 | NGVD29 sites are excluded rather than datum-corrected | Medium | VERTCON correction is available but adds complexity; document excluded site count |
-| A5 | Monthly median aggregation adequately represents water table for months with irregular sampling | Low | Linear interpolation limited to single-month gaps; no extrapolation |
+| A5 | Monthly median aggregation adequately represents water table for months with irregular sampling | Low | No gap filling — sparse months remain absent; `coverage_fraction` and `max_gap_months` flags let downstream code exclude gappy sites |
 | A6 | Land surface altitude (`alt_va`) from NWIS is accurate to ±1 m | Medium | Cross-check a sample of sites against 3DEP DEM; flag outliers |
 
 ## Modeling Assumptions

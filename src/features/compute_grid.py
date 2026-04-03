@@ -1,0 +1,217 @@
+"""
+Define the canonical 1 km CONUS analysis grid and provide coordinate helpers.
+
+The canonical grid is derived from the MERIT Hydro DEM reprojected to EPSG:5070
+so that the interpolation grid is always pixel-aligned with the DEM secondary
+variable.  All downstream scripts import from this module rather than re-deriving
+the grid independently.
+
+Usage:
+    python -m src.features.compute_grid --dem data/raw/dem/merit_hydro_1km_5070.tif \
+        --output-dir data/processed
+
+Outputs:
+    data/processed/conus_grid_1km.nc   ← NetCDF with X/Y coordinate arrays + metadata
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+from pathlib import Path
+from typing import NamedTuple
+
+import numpy as np
+import rasterio
+import xarray as xr
+from rasterio.crs import CRS
+from rasterio.transform import AffineTransformer
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+TARGET_CRS = CRS.from_epsg(5070)
+TARGET_RES_M = 1000.0
+
+
+class GridSpec(NamedTuple):
+    """Canonical CONUS 1 km grid specification."""
+
+    transform: rasterio.transform.Affine
+    width: int
+    height: int
+    crs: CRS
+    nodata: float
+
+    @property
+    def x_coords(self) -> np.ndarray:
+        """Cell-centre X coordinates in EPSG:5070 (metres)."""
+        left = self.transform.c + self.transform.a * 0.5  # pixel centre
+        return left + np.arange(self.width) * self.transform.a
+
+    @property
+    def y_coords(self) -> np.ndarray:
+        """Cell-centre Y coordinates in EPSG:5070 (metres, top-to-bottom)."""
+        top = self.transform.f + self.transform.e * 0.5  # pixel centre (e is negative)
+        return top + np.arange(self.height) * self.transform.e
+
+    def prediction_dataframe(self) -> "pd.DataFrame":
+        """
+        Return a (width×height, 2) DataFrame with columns X, Y for every cell.
+
+        The order is row-major (Y varies slowly, X varies fast), suitable for
+        passing directly to ``gs.Gridding.prediction_grid`` helpers.
+        """
+        import pandas as pd
+
+        xx, yy = np.meshgrid(self.x_coords, self.y_coords)
+        return pd.DataFrame({"X": xx.ravel(), "Y": yy.ravel()})
+
+    def unravel(self, flat_values: np.ndarray) -> np.ndarray:
+        """Reshape a flat (height*width,) array back to (height, width)."""
+        return flat_values.reshape(self.height, self.width)
+
+
+def load_grid_spec(dem_path: Path) -> GridSpec:
+    """
+    Derive the canonical GridSpec from the MERIT Hydro DEM raster.
+
+    Parameters
+    ----------
+    dem_path:
+        Path to ``merit_hydro_1km_5070.tif``.
+
+    Returns
+    -------
+    GridSpec
+    """
+    with rasterio.open(dem_path) as src:
+        if src.crs.to_epsg() != 5070:
+            raise ValueError(f"DEM CRS is {src.crs} — expected EPSG:5070. Re-run make dem.")
+        return GridSpec(
+            transform=src.transform,
+            width=src.width,
+            height=src.height,
+            crs=src.crs,
+            nodata=src.nodata if src.nodata is not None else -9999.0,
+        )
+
+
+def read_dem_array(dem_path: Path, grid: GridSpec) -> np.ndarray:
+    """
+    Load DEM elevation values as a masked 2-D float32 array (height × width).
+
+    NoData cells are returned as NaN.
+
+    Parameters
+    ----------
+    dem_path:
+        Path to the 1 km EPSG:5070 DEM GeoTIFF.
+    grid:
+        GridSpec from :func:`load_grid_spec`.
+
+    Returns
+    -------
+    np.ndarray, shape (height, width), dtype float32
+    """
+    with rasterio.open(dem_path) as src:
+        arr = src.read(1, out_dtype=np.float32)
+    arr[arr == grid.nodata] = np.nan
+    return arr
+
+
+def sample_dem_at_points(
+    dem_path: Path,
+    x_5070: np.ndarray,
+    y_5070: np.ndarray,
+) -> np.ndarray:
+    """
+    Sample DEM elevation at arbitrary EPSG:5070 point coordinates.
+
+    Uses bilinear interpolation via rasterio index lookup.
+
+    Parameters
+    ----------
+    dem_path:
+        Path to the 1 km EPSG:5070 DEM GeoTIFF.
+    x_5070, y_5070:
+        1-D arrays of EPSG:5070 coordinates.
+
+    Returns
+    -------
+    np.ndarray of shape (n,), dtype float32 — NaN where point falls outside DEM extent
+    """
+    with rasterio.open(dem_path) as src:
+        coords = list(zip(x_5070.tolist(), y_5070.tolist()))
+        values = np.array(
+            [v[0] for v in src.sample(coords, indexes=1)],
+            dtype=np.float32,
+        )
+        nd = src.nodata if src.nodata is not None else -9999.0
+    values[values == nd] = np.nan
+    return values
+
+
+def save_grid_nc(grid: GridSpec, output_path: Path) -> None:
+    """
+    Write a lightweight NetCDF with X/Y coordinate arrays and grid metadata.
+
+    This is used for documentation and by downstream scripts that want grid
+    metadata without opening the full DEM.
+
+    Parameters
+    ----------
+    grid:
+        Canonical GridSpec.
+    output_path:
+        Destination ``conus_grid_1km.nc``.
+    """
+    ds = xr.Dataset(
+        coords={
+            "x": ("x", grid.x_coords.astype(np.float64), {"units": "m", "crs": "EPSG:5070", "axis": "X"}),
+            "y": ("y", grid.y_coords.astype(np.float64), {"units": "m", "crs": "EPSG:5070", "axis": "Y"}),
+        },
+        attrs={
+            "title": "Canonical CONUS 1 km analysis grid",
+            "crs": "EPSG:5070 (NAD83 / Conus Albers)",
+            "resolution_m": TARGET_RES_M,
+            "width": grid.width,
+            "height": grid.height,
+            "transform": str(grid.transform),
+        },
+    )
+    ds.to_netcdf(output_path)
+    logger.info(f"Grid metadata saved: {output_path}  ({grid.width} × {grid.height})")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Build canonical CONUS 1 km grid from MERIT Hydro DEM")
+    parser.add_argument(
+        "--dem",
+        type=Path,
+        default=Path("data/raw/dem/merit_hydro_1km_5070.tif"),
+        help="Path to MERIT Hydro 1 km EPSG:5070 DEM.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("data/processed"),
+        help="Directory for conus_grid_1km.nc output.",
+    )
+    args = parser.parse_args()
+
+    if not args.dem.exists():
+        raise FileNotFoundError(f"DEM not found: {args.dem}. Run `make dem` first.")
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    grid = load_grid_spec(args.dem)
+    logger.info(f"Grid: {grid.width} × {grid.height} px at {TARGET_RES_M} m, EPSG:5070")
+
+    save_grid_nc(grid, args.output_dir / "conus_grid_1km.nc")
+
+
+if __name__ == "__main__":
+    main()

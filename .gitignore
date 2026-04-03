@@ -47,6 +47,9 @@ build/
 .ipynb_checkpoints/
 *.ipynb_checkpoints
 
+# ── Figure outputs ────────────────────────────────────────────────────────────
+figures/
+
 # ── macOS ─────────────────────────────────────────────────────────────────────
 .DS_Store
 .AppleDouble

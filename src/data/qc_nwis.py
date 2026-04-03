@@ -8,8 +8,8 @@ Applies the full QC chain from the water-table-model skill:
   4. Convert feet → meters
   5. Compute WTE from DTW + land surface altitude
   6. Check datum consistency (drop NGVD29 or flag for VERTCON)
-  7. Aggregate to monthly medians per site
-  8. Fill single-month gaps via linear interpolation (no extrapolation)
+  7. Aggregate to monthly medians per site — NO gap filling; sparse months stay NaN
+  8. Compute per-site temporal coverage statistics; flag sparse / gappy time series
 
 Usage:
     python -m src.data.qc_nwis --input-dir data/raw/nwis --output data/processed/nwis_gwlevels_monthly.parquet
@@ -61,6 +61,12 @@ DEEP_WELL_THRESHOLD_FT = 500
 
 # Minimum number of measurements per site to keep
 MIN_OBS_PER_SITE = 10
+
+# Temporal coverage thresholds for sparsity flagging
+# Sites with fewer than this fraction of possible months observed → is_sparse_timeseries
+MIN_COVERAGE_FRACTION = 0.10
+# Sites with a gap longer than this (months) → has_long_gap
+MAX_GAP_MONTHS_FLAG = 36
 
 
 def load_raw_data(input_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -248,97 +254,102 @@ def qc_filter(
 
 def aggregate_monthly(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Aggregate to monthly medians per site.
+    Aggregate raw observations to monthly medians per site.
 
-    Then fill single-month gaps via linear interpolation (no extrapolation).
+    No gap filling — months without observations are absent from the output.
+    Downstream code must handle NaN / missing months explicitly; do not impute.
+    n_obs records how many raw measurements contributed to each site-month median.
     """
     df["year"] = df["date"].dt.year
     df["month"] = df["date"].dt.month
 
-    # Monthly median per site
+    agg_kwargs: dict = {
+        "lat": ("lat", "first"),
+        "lon": ("lon", "first"),
+        "wte_m": ("wte_m", "median"),
+        "dtw_m": ("dtw_m", "median"),
+        "n_obs": ("dtw_m", "size"),
+        "well_depth_m": ("well_depth_m", "first"),
+        "is_deep_well": ("is_deep_well", "first"),
+    }
+    if "aquifer_cd" in df.columns:
+        agg_kwargs["aquifer_cd"] = ("aquifer_cd", "first")
+
     monthly = (
         df.groupby(["site_no", "year", "month"])
-        .agg(
-            lat=("lat", "first"),
-            lon=("lon", "first"),
-            wte_m=("wte_m", "median"),
-            dtw_m=("dtw_m", "median"),
-            n_obs=("dtw_m", "size"),
-            well_depth_m=("well_depth_m", "first"),
-            aquifer_cd=("aquifer_cd", "first") if "aquifer_cd" in df.columns else ("site_no", "first"),
-            is_deep_well=("is_deep_well", "first"),
-        )
+        .agg(**agg_kwargs)
         .reset_index()
     )
 
-    logger.info(f"  Monthly aggregation: {len(monthly):,} site-months")
-
-    # Fill single-month gaps per site via linear interpolation
-    # Create a continuous year-month index per site and reindex
-    filled_parts = []
-    for site_no, grp in monthly.groupby("site_no"):
-        grp = grp.sort_values(["year", "month"]).copy()
-        grp["ym"] = grp["year"] * 12 + grp["month"]
-
-        ym_min, ym_max = grp["ym"].min(), grp["ym"].max()
-        full_ym = pd.DataFrame({"ym": range(ym_min, ym_max + 1)})
-        full_ym["year"] = full_ym["ym"] // 12
-        full_ym["month"] = full_ym["ym"] % 12
-        # Fix month=0 → December of previous year
-        mask_zero = full_ym["month"] == 0
-        full_ym.loc[mask_zero, "month"] = 12
-        full_ym.loc[mask_zero, "year"] -= 1
-
-        merged = full_ym.merge(grp, on=["year", "month"], how="left")
-        merged["site_no"] = site_no
-
-        # Forward-fill static columns
-        for col in ["lat", "lon", "well_depth_m", "aquifer_cd", "is_deep_well"]:
-            if col in merged.columns:
-                merged[col] = merged[col].ffill().bfill()
-
-        # Interpolate WTE and DTW — limit=1 means fill only single-month gaps
-        for col in ["wte_m", "dtw_m"]:
-            if col in merged.columns:
-                merged[col] = merged[col].interpolate(method="linear", limit=1)
-
-        # Mark interpolated rows
-        merged["interpolated"] = merged["n_obs"].isna()
-        merged["n_obs"] = merged["n_obs"].fillna(0).astype(int)
-
-        filled_parts.append(merged[
-            ["site_no", "year", "month", "lat", "lon", "wte_m", "dtw_m",
-             "n_obs", "well_depth_m", "aquifer_cd", "is_deep_well", "interpolated"]
-        ])
-
-    result = pd.concat(filled_parts, ignore_index=True)
-    n_interp = result["interpolated"].sum()
-    logger.info(f"  Filled {n_interp:,} single-month gaps via linear interpolation")
-    logger.info(f"  Final dataset: {len(result):,} site-months, {result['site_no'].nunique():,} sites")
-
-    return result
+    logger.info(
+        f"  Monthly aggregation: {len(monthly):,} site-months, "
+        f"{monthly['site_no'].nunique():,} sites — no gap filling applied"
+    )
+    return monthly
 
 
 def build_clean_sites(df_monthly: pd.DataFrame) -> pd.DataFrame:
-    """Build a clean site-level summary table."""
-    sites = (
-        df_monthly.groupby("site_no")
-        .agg(
-            lat=("lat", "first"),
-            lon=("lon", "first"),
-            mean_wte_m=("wte_m", "mean"),
-            mean_dtw_m=("dtw_m", "mean"),
-            median_wte_m=("wte_m", "median"),
-            median_dtw_m=("dtw_m", "median"),
-            std_wte_m=("wte_m", "std"),
-            n_months=("wte_m", "count"),
-            first_year=("year", "min"),
-            last_year=("year", "max"),
-            well_depth_m=("well_depth_m", "first"),
-            aquifer_cd=("aquifer_cd", "first"),
-            is_deep_well=("is_deep_well", "first"),
-        )
-        .reset_index()
+    """
+    Build a clean site-level summary table with temporal coverage statistics.
+
+    Coverage statistics (computed from non-interpolated monthly records):
+        n_observed_months   : months with at least one real measurement
+        n_possible_months   : calendar span from first to last observed month
+        coverage_fraction   : n_observed / n_possible  (0–1)
+        max_gap_months      : longest consecutive gap between observations (months)
+        record_span_years   : calendar span in years
+        is_sparse_timeseries: True if coverage_fraction < MIN_COVERAGE_FRACTION
+        has_long_gap        : True if max_gap_months > MAX_GAP_MONTHS_FLAG
+
+    Only sites without either flag should be used in spatial interpolation.
+    """
+    agg_kwargs: dict = {
+        "lat": ("lat", "first"),
+        "lon": ("lon", "first"),
+        "mean_wte_m": ("wte_m", "mean"),
+        "mean_dtw_m": ("dtw_m", "mean"),
+        "median_wte_m": ("wte_m", "median"),
+        "median_dtw_m": ("dtw_m", "median"),
+        "std_wte_m": ("wte_m", "std"),
+        "n_observed_months": ("wte_m", "count"),
+        "first_year": ("year", "min"),
+        "last_year": ("year", "max"),
+        "well_depth_m": ("well_depth_m", "first"),
+        "is_deep_well": ("is_deep_well", "first"),
+    }
+    if "aquifer_cd" in df_monthly.columns:
+        agg_kwargs["aquifer_cd"] = ("aquifer_cd", "first")
+
+    sites = df_monthly.groupby("site_no").agg(**agg_kwargs).reset_index()
+
+    # Temporal coverage statistics — computed per site over the raw monthly records
+    def _coverage(grp: pd.DataFrame) -> pd.Series:
+        ym = grp["year"] * 12 + grp["month"]
+        ym_sorted = ym.sort_values().values
+        n_possible = int(ym_sorted[-1] - ym_sorted[0] + 1)
+        n_obs = int((grp["n_obs"] > 0).sum())
+        coverage = n_obs / n_possible if n_possible > 0 else 0.0
+        gaps = np.diff(ym_sorted) - 1  # consecutive gaps in months
+        max_gap = int(gaps.max()) if len(gaps) > 0 else 0
+        return pd.Series({
+            "n_possible_months": n_possible,
+            "coverage_fraction": round(coverage, 4),
+            "max_gap_months": max_gap,
+            "record_span_years": round(n_possible / 12, 2),
+        })
+
+    cov = df_monthly.groupby("site_no").apply(_coverage, include_groups=False).reset_index()
+    sites = sites.merge(cov, on="site_no", how="left")
+
+    # Quality flags
+    sites["is_sparse_timeseries"] = sites["coverage_fraction"] < MIN_COVERAGE_FRACTION
+    sites["has_long_gap"] = sites["max_gap_months"] > MAX_GAP_MONTHS_FLAG
+
+    n_sparse = sites["is_sparse_timeseries"].sum()
+    n_gap = sites["has_long_gap"].sum()
+    logger.info(
+        f"  Site-level flags: {n_sparse:,} sparse (coverage < {MIN_COVERAGE_FRACTION:.0%}), "
+        f"{n_gap:,} with gap > {MAX_GAP_MONTHS_FLAG} months"
     )
     return sites
 

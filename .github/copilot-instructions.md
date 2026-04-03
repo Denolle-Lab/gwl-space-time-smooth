@@ -25,7 +25,10 @@ pixi shell            # activate environment in terminal
 ```bash
 make data       # Download raw NWIS GW levels (state-by-state, checkpointed)
 make qc         # QC + monthly aggregation → data/processed/
-make covariates # Placeholder: DEM, PRISM, soils, NLCD, NHDPlus
+make dem        # Download MERIT Hydro DEM → data/raw/dem/merit_hydro_1km_5070.tif
+make grid       # Build canonical 1 km CONUS grid → data/processed/conus_grid_1km.nc
+make baseline   # Co-krige WTE baseline (MM1 + DEM) → data/processed/baseline_*.tif
+make anomalies  # Krige monthly anomaly fields → data/processed/gwl_*.zarr
 make eda        # Execute EDA notebook → HTML
 make train      # Placeholder: model training
 make validate   # Placeholder: validation pipeline
@@ -38,8 +41,9 @@ make clean-all  # Remove everything including raw downloads
 ```
 data/raw/nwis/            ← one parquet per state (git-ignored)
                             download_log.json ← checkpoint + provenance (git-tracked)
+data/raw/dem/             ← MERIT Hydro tiles + merit_hydro_1km_5070.tif (git-ignored)
 data/raw/MANIFEST.md      ← dataset registry (git-tracked)
-data/processed/           ← monthly aggregated parquets (git-ignored)
+data/processed/           ← QC'd parquets, GeoTIFFs, Zarr archives (git-ignored)
 data/comparison/          ← held-out comparison datasets (git-ignored)
 ```
 
@@ -62,9 +66,16 @@ Update `data/raw/MANIFEST.md` after adding any new dataset.
 5. Compute WTE from DTW + `alt_va` (land surface altitude)
 6. Exclude NGVD29 datum sites (VERTCON correction deferred — see A4 in `docs/assumptions.md`)
 7. Aggregate to monthly medians per site
-8. Fill single-month gaps via linear interpolation (no extrapolation)
+8. Compute per-site temporal coverage statistics (`coverage_fraction`, `max_gap_months`); flag sparse sites (`is_sparse_timeseries`) and sites with long gaps (`has_long_gap`) — **no gap filling, no interpolation**
 
 **Modeling**
+- Interpolation: GStatSim co-kriging MM1 (DEM as secondary variable) for the spatial baseline;
+  ordinary kriging for monthly anomaly fields. See `src/models/interpolate_baseline.py` and
+  `src/models/interpolate_anomalies.py`.
+- NST (Normal Score Transform via `QuantileTransformer`) is applied before any kriging step;
+  inverse NST applied to all outputs.
+- Variograms fitted per HUC-2 region (18 regions) using `scikit-gstat`; params saved to
+  `data/processed/variogram_params_huc2.json`.
 - Use well-density confidence mask alongside predictions; flag cells >50 km from nearest well.
 - Karst (Edwards Plateau, Ozarks, Florida), urban, and permafrost fringe regions need explicit flags — see `docs/limitations.md`.
 - Ensemble uncertainty estimates underestimate error in extrapolation regions (L13).
