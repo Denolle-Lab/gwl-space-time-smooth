@@ -1,0 +1,38 @@
+name: wtm
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - numpy
+  - pandas
+  - geopandas
+  - xarray
+  - rioxarray
+  - rasterio
+  - fiona
+  - shapely>=2.0
+  - scipy
+  - scikit-learn
+  - xgboost
+  - lightgbm
+  - matplotlib
+  - cartopy
+  - pyproj
+  - pystac-client
+  - planetary-computer
+  - jupyter
+  - jupyterlab
+  - dask
+  - netcdf4
+  - h5py
+  - pyarrow          # for parquet I/O
+  - tqdm
+  - requests
+  - pip:
+    - dataretrieval   # USGS NWIS Python wrapper
+    - pykrige         # kriging
+    - verde           # spatial gridding + CV (Fatiando a Terra)
+    - mapie           # conformal prediction
+    - richdem         # DEM analysis / TWI
+    - hsclient        # HydroShare API

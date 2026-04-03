@@ -1,0 +1,397 @@
+"""
+QC and process raw NWIS groundwater data into analysis-ready monthly parquet.
+
+Applies the full QC chain from the water-table-model skill:
+  1. Filter bad status codes (pumping, dry, obstructed, etc.)
+  2. Remove sites with < N measurements
+  3. Flag deep wells likely penetrating confined aquifers
+  4. Convert feet → meters
+  5. Compute WTE from DTW + land surface altitude
+  6. Check datum consistency (drop NGVD29 or flag for VERTCON)
+  7. Aggregate to monthly medians per site
+  8. Fill single-month gaps via linear interpolation (no extrapolation)
+
+Usage:
+    python -m src.data.qc_nwis --input-dir data/raw/nwis --output data/processed/nwis_gwlevels_monthly.parquet
+
+Output:
+    data/processed/nwis_gwlevels_monthly.parquet
+    data/processed/nwis_sites_clean.parquet
+    data/processed/qc_report.json
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+from datetime import datetime, timezone
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+# Feet to meters
+FT_TO_M = 0.3048
+
+# Status codes to DROP — keep only blank/NaN and "S" (static level)
+BAD_STATUS_CODES = {
+    "D",  # Dry
+    "E",  # Recently flowing nearby
+    "F",  # Flowing
+    "G",  # Nearby recently flowing
+    "I",  # Injecting
+    "N",  # Measurement discontinued
+    "O",  # Obstructed
+    "P",  # Pumping
+    "R",  # Recently pumped
+    "T",  # Nearby recently pumped
+    "V",  # Foreign substance
+    "Z",  # Other
+}
+
+# Wells deeper than this (feet) are flagged as likely confined
+DEEP_WELL_THRESHOLD_FT = 500
+
+# Minimum number of measurements per site to keep
+MIN_OBS_PER_SITE = 10
+
+
+def load_raw_data(input_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Load and concatenate all state-level raw parquet files."""
+    gw_files = sorted(input_dir.glob("*_gwlevels.parquet"))
+    site_files = sorted(input_dir.glob("*_sites.parquet"))
+
+    if not gw_files:
+        raise FileNotFoundError(f"No *_gwlevels.parquet files found in {input_dir}")
+
+    logger.info(f"Loading GW levels from {len(gw_files)} state files...")
+    dfs_gw = [pd.read_parquet(f) for f in gw_files]
+    df_gw = pd.concat(dfs_gw, ignore_index=True)
+    logger.info(f"  → {len(df_gw):,} total raw GW level records")
+
+    logger.info(f"Loading site metadata from {len(site_files)} state files...")
+    dfs_sites = [pd.read_parquet(f) for f in site_files]
+    df_sites = pd.concat(dfs_sites, ignore_index=True)
+    # Deduplicate sites (same well can appear in multiple queries)
+    df_sites = df_sites.drop_duplicates(subset=["site_no"], keep="first")
+    logger.info(f"  → {len(df_sites):,} unique GW sites")
+
+    return df_gw, df_sites
+
+
+def qc_filter(
+    df_gw: pd.DataFrame,
+    df_sites: pd.DataFrame,
+    min_obs: int = MIN_OBS_PER_SITE,
+) -> tuple[pd.DataFrame, dict]:
+    """
+    Apply the full QC chain. Returns cleaned DataFrame and a QC report dict.
+    """
+    report: dict = {"raw_records": len(df_gw), "raw_sites": df_sites["site_no"].nunique()}
+
+    # ---- Step 1: Filter bad status codes ----
+    if "lev_status_cd" in df_gw.columns:
+        bad_mask = df_gw["lev_status_cd"].isin(BAD_STATUS_CODES)
+        n_bad_status = bad_mask.sum()
+        df_gw = df_gw[~bad_mask].copy()
+        logger.info(f"  Dropped {n_bad_status:,} records with bad status codes")
+    else:
+        n_bad_status = 0
+        logger.warning("  Column 'lev_status_cd' not found — skipping status filter")
+    report["dropped_bad_status"] = int(n_bad_status)
+
+    # ---- Step 2: Parse dates, drop unparseable ----
+    if "lev_dt" in df_gw.columns:
+        df_gw["date"] = pd.to_datetime(df_gw["lev_dt"], errors="coerce")
+    elif "datetime" in df_gw.columns:
+        df_gw["date"] = pd.to_datetime(df_gw["datetime"], errors="coerce")
+    else:
+        raise KeyError("Cannot find date column ('lev_dt' or 'datetime') in GW data")
+
+    n_no_date = df_gw["date"].isna().sum()
+    df_gw = df_gw.dropna(subset=["date"]).copy()
+    report["dropped_no_date"] = int(n_no_date)
+
+    # ---- Step 3: Parse water level, drop missing ----
+    # dataretrieval may return 'lev_va' as string; coerce to float
+    lev_col = "lev_va" if "lev_va" in df_gw.columns else None
+    if lev_col is None:
+        # Try alternative column names
+        for candidate in ["value", "result_va", "lev_va_00"]:
+            if candidate in df_gw.columns:
+                lev_col = candidate
+                break
+    if lev_col is None:
+        raise KeyError("Cannot find water level column in GW data")
+
+    df_gw["dtw_ft"] = pd.to_numeric(df_gw[lev_col], errors="coerce")
+    n_no_level = df_gw["dtw_ft"].isna().sum()
+    df_gw = df_gw.dropna(subset=["dtw_ft"]).copy()
+    report["dropped_no_level"] = int(n_no_level)
+
+    # Drop negative DTW (instrument errors; DTW < 0 would mean water above surface,
+    # which is rare and usually an artesian/error condition)
+    n_negative = (df_gw["dtw_ft"] < 0).sum()
+    # Keep slightly negative values (< -2 ft) as they may be valid artesian conditions;
+    # drop extreme negatives
+    extreme_neg = df_gw["dtw_ft"] < -50
+    df_gw = df_gw[~extreme_neg].copy()
+    report["dropped_extreme_negative"] = int(extreme_neg.sum())
+    logger.info(f"  Dropped {extreme_neg.sum():,} records with DTW < -50 ft")
+
+    # ---- Step 4: Merge site metadata ----
+    # Ensure site_no is string in both
+    df_gw["site_no"] = df_gw["site_no"].astype(str).str.strip()
+    df_sites["site_no"] = df_sites["site_no"].astype(str).str.strip()
+
+    # Select key columns from site metadata
+    site_cols = ["site_no"]
+    col_map = {
+        "dec_lat_va": "lat",
+        "dec_long_va": "lon",
+        "alt_va": "alt_ft",
+        "alt_datum_cd": "alt_datum",
+        "well_depth_va": "well_depth_ft",
+        "aqfr_cd": "aquifer_cd",
+    }
+    for raw_col, clean_col in col_map.items():
+        if raw_col in df_sites.columns:
+            site_cols.append(raw_col)
+
+    df_sites_slim = df_sites[site_cols].copy()
+    df_sites_slim = df_sites_slim.rename(columns=col_map)
+
+    # Convert numeric columns
+    for col in ["lat", "lon", "alt_ft", "well_depth_ft"]:
+        if col in df_sites_slim.columns:
+            df_sites_slim[col] = pd.to_numeric(df_sites_slim[col], errors="coerce")
+
+    df = df_gw.merge(df_sites_slim, on="site_no", how="left")
+    n_no_site = df["lat"].isna().sum()
+    df = df.dropna(subset=["lat", "lon"]).copy()
+    report["dropped_no_coordinates"] = int(n_no_site)
+
+    # ---- Step 5: Datum check ----
+    if "alt_datum" in df.columns:
+        ngvd29_mask = df["alt_datum"].str.upper().str.contains("NGVD", na=False)
+        n_ngvd29 = ngvd29_mask.sum()
+        # Drop NGVD29 sites (conservative; VERTCON correction is an option)
+        df = df[~ngvd29_mask].copy()
+        logger.info(f"  Dropped {n_ngvd29:,} records with NGVD29 datum")
+    else:
+        n_ngvd29 = 0
+    report["dropped_ngvd29"] = int(n_ngvd29)
+
+    # ---- Step 6: Flag deep wells ----
+    if "well_depth_ft" in df.columns:
+        df["is_deep_well"] = df["well_depth_ft"] > DEEP_WELL_THRESHOLD_FT
+        n_deep = df["is_deep_well"].sum()
+        logger.info(
+            f"  Flagged {n_deep:,} records from wells deeper than "
+            f"{DEEP_WELL_THRESHOLD_FT} ft (likely confined — kept but flagged)"
+        )
+    else:
+        df["is_deep_well"] = False
+        n_deep = 0
+    report["flagged_deep_wells"] = int(n_deep)
+
+    # ---- Step 7: Convert units (feet → meters) ----
+    df["dtw_m"] = df["dtw_ft"] * FT_TO_M
+    if "alt_ft" in df.columns:
+        df["alt_m"] = df["alt_ft"] * FT_TO_M
+        # Compute water table elevation: WTE = land surface altitude - DTW
+        df["wte_m"] = df["alt_m"] - df["dtw_m"]
+        n_no_alt = df["alt_m"].isna().sum()
+        report["sites_missing_altitude"] = int(
+            df.loc[df["alt_m"].isna(), "site_no"].nunique()
+        )
+    else:
+        df["alt_m"] = np.nan
+        df["wte_m"] = np.nan
+        report["sites_missing_altitude"] = int(df["site_no"].nunique())
+
+    if "well_depth_ft" in df.columns:
+        df["well_depth_m"] = df["well_depth_ft"] * FT_TO_M
+    else:
+        df["well_depth_m"] = np.nan
+
+    # ---- Step 8: Remove sites with < min_obs measurements ----
+    obs_counts = df.groupby("site_no").size()
+    sparse_sites = obs_counts[obs_counts < min_obs].index
+    n_sparse = len(sparse_sites)
+    n_records_sparse = df["site_no"].isin(sparse_sites).sum()
+    df = df[~df["site_no"].isin(sparse_sites)].copy()
+    logger.info(
+        f"  Dropped {n_sparse:,} sites with < {min_obs} observations "
+        f"({n_records_sparse:,} records)"
+    )
+    report["dropped_sparse_sites"] = int(n_sparse)
+    report["dropped_sparse_records"] = int(n_records_sparse)
+
+    # ---- Summary ----
+    report["clean_records"] = len(df)
+    report["clean_sites"] = int(df["site_no"].nunique())
+    logger.info(
+        f"  QC complete: {report['clean_records']:,} records, "
+        f"{report['clean_sites']:,} sites"
+    )
+
+    return df, report
+
+
+def aggregate_monthly(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Aggregate to monthly medians per site.
+
+    Then fill single-month gaps via linear interpolation (no extrapolation).
+    """
+    df["year"] = df["date"].dt.year
+    df["month"] = df["date"].dt.month
+
+    # Monthly median per site
+    monthly = (
+        df.groupby(["site_no", "year", "month"])
+        .agg(
+            lat=("lat", "first"),
+            lon=("lon", "first"),
+            wte_m=("wte_m", "median"),
+            dtw_m=("dtw_m", "median"),
+            n_obs=("dtw_m", "size"),
+            well_depth_m=("well_depth_m", "first"),
+            aquifer_cd=("aquifer_cd", "first") if "aquifer_cd" in df.columns else ("site_no", "first"),
+            is_deep_well=("is_deep_well", "first"),
+        )
+        .reset_index()
+    )
+
+    logger.info(f"  Monthly aggregation: {len(monthly):,} site-months")
+
+    # Fill single-month gaps per site via linear interpolation
+    # Create a continuous year-month index per site and reindex
+    filled_parts = []
+    for site_no, grp in monthly.groupby("site_no"):
+        grp = grp.sort_values(["year", "month"]).copy()
+        grp["ym"] = grp["year"] * 12 + grp["month"]
+
+        ym_min, ym_max = grp["ym"].min(), grp["ym"].max()
+        full_ym = pd.DataFrame({"ym": range(ym_min, ym_max + 1)})
+        full_ym["year"] = full_ym["ym"] // 12
+        full_ym["month"] = full_ym["ym"] % 12
+        # Fix month=0 → December of previous year
+        mask_zero = full_ym["month"] == 0
+        full_ym.loc[mask_zero, "month"] = 12
+        full_ym.loc[mask_zero, "year"] -= 1
+
+        merged = full_ym.merge(grp, on=["year", "month"], how="left")
+        merged["site_no"] = site_no
+
+        # Forward-fill static columns
+        for col in ["lat", "lon", "well_depth_m", "aquifer_cd", "is_deep_well"]:
+            if col in merged.columns:
+                merged[col] = merged[col].ffill().bfill()
+
+        # Interpolate WTE and DTW — limit=1 means fill only single-month gaps
+        for col in ["wte_m", "dtw_m"]:
+            if col in merged.columns:
+                merged[col] = merged[col].interpolate(method="linear", limit=1)
+
+        # Mark interpolated rows
+        merged["interpolated"] = merged["n_obs"].isna()
+        merged["n_obs"] = merged["n_obs"].fillna(0).astype(int)
+
+        filled_parts.append(merged[
+            ["site_no", "year", "month", "lat", "lon", "wte_m", "dtw_m",
+             "n_obs", "well_depth_m", "aquifer_cd", "is_deep_well", "interpolated"]
+        ])
+
+    result = pd.concat(filled_parts, ignore_index=True)
+    n_interp = result["interpolated"].sum()
+    logger.info(f"  Filled {n_interp:,} single-month gaps via linear interpolation")
+    logger.info(f"  Final dataset: {len(result):,} site-months, {result['site_no'].nunique():,} sites")
+
+    return result
+
+
+def build_clean_sites(df_monthly: pd.DataFrame) -> pd.DataFrame:
+    """Build a clean site-level summary table."""
+    sites = (
+        df_monthly.groupby("site_no")
+        .agg(
+            lat=("lat", "first"),
+            lon=("lon", "first"),
+            mean_wte_m=("wte_m", "mean"),
+            mean_dtw_m=("dtw_m", "mean"),
+            median_wte_m=("wte_m", "median"),
+            median_dtw_m=("dtw_m", "median"),
+            std_wte_m=("wte_m", "std"),
+            n_months=("wte_m", "count"),
+            first_year=("year", "min"),
+            last_year=("year", "max"),
+            well_depth_m=("well_depth_m", "first"),
+            aquifer_cd=("aquifer_cd", "first"),
+            is_deep_well=("is_deep_well", "first"),
+        )
+        .reset_index()
+    )
+    return sites
+
+
+def main():
+    parser = argparse.ArgumentParser(description="QC and process NWIS groundwater data")
+    parser.add_argument(
+        "--input-dir",
+        type=Path,
+        default=Path("data/raw/nwis"),
+        help="Directory with raw state-level parquet files",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("data/processed/nwis_gwlevels_monthly.parquet"),
+        help="Output path for monthly parquet",
+    )
+    parser.add_argument(
+        "--min-obs",
+        type=int,
+        default=MIN_OBS_PER_SITE,
+        help=f"Minimum observations per site (default: {MIN_OBS_PER_SITE})",
+    )
+    args = parser.parse_args()
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+
+    # Load
+    df_gw, df_sites = load_raw_data(args.input_dir)
+
+    # QC
+    df_clean, qc_report = qc_filter(df_gw, df_sites, min_obs=args.min_obs)
+
+    # Aggregate to monthly
+    df_monthly = aggregate_monthly(df_clean)
+
+    # Save monthly data
+    df_monthly.to_parquet(args.output, index=False)
+    logger.info(f"Saved monthly data to {args.output}")
+
+    # Save clean site summary
+    sites_path = args.output.parent / "nwis_sites_clean.parquet"
+    df_sites_clean = build_clean_sites(df_monthly)
+    df_sites_clean.to_parquet(sites_path, index=False)
+    logger.info(f"Saved {len(df_sites_clean):,} clean site summaries to {sites_path}")
+
+    # Save QC report
+    report_path = args.output.parent / "qc_report.json"
+    with open(report_path, "w") as f:
+        json.dump(qc_report, f, indent=2)
+    logger.info(f"Saved QC report to {report_path}")
+
+
+if __name__ == "__main__":
+    main()
