@@ -1,0 +1,63 @@
+# ── Data files ────────────────────────────────────────────────────────────────
+# Ignore all binary/large data; keep provenance files (MANIFEST.md, *.json logs)
+*.parquet
+*.csv
+*.tsv
+*.nc
+*.nc4
+*.h5
+*.hdf5
+*.tif
+*.tiff
+*.img
+*.vrt
+*.zip
+*.tar.gz
+*.gz
+*.shp
+*.dbf
+*.shx
+*.prj
+*.cpg
+*.geojson
+
+# Keep provenance / manifest files inside data/
+!data/**/MANIFEST.md
+!data/**/download_log.json
+!data/**/.gitkeep
+
+# ── pixi environment ──────────────────────────────────────────────────────────
+.pixi/
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ── macOS ─────────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# ── Editors ───────────────────────────────────────────────────────────────────
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+
+# ── Environment / secrets ─────────────────────────────────────────────────────
+.env
+.env.*

@@ -1,7 +1,7 @@
 .PHONY: data qc covariates eda train validate clean all
 
 # === Configuration ===
-START_DATE := 2000-01-01
+START_DATE := 2026-01-01
 RAW_DIR := data/raw/nwis
 PROCESSED_DIR := data/processed
 MONTHLY_PARQUET := $(PROCESSED_DIR)/nwis_gwlevels_monthly.parquet
@@ -13,13 +13,13 @@ all: data qc
 
 ## Download raw NWIS groundwater data (state-by-state, checkpointed)
 data:
-	python -m src.data.download_nwis \
+	pixi run python -m src.data.download_nwis \
 		--start-date $(START_DATE) \
 		--output-dir $(RAW_DIR)
 
 ## Run QC filtering and monthly aggregation
 qc: $(RAW_DIR)/download_log.json
-	python -m src.data.qc_nwis \
+	pixi run python -m src.data.qc_nwis \
 		--input-dir $(RAW_DIR) \
 		--output $(MONTHLY_PARQUET)
 
@@ -34,7 +34,7 @@ covariates:
 
 ## Run EDA notebook — placeholder
 eda:
-	jupyter nbconvert --execute notebooks/01_eda.ipynb --to html
+	pixi run jupyter nbconvert --execute notebooks/01_eda.ipynb --to html
 
 ## Train model — placeholder
 train:

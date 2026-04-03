@@ -1,0 +1,49 @@
+[workspace]
+name = "gwl-space-time-smooth"
+version = "0.1.0"
+description = "Groundwater level space-time smoothing"
+channels = ["conda-forge"]
+platforms = ["osx-arm64", "osx-64", "linux-64"]
+
+[dependencies]
+python = "3.11.*"
+numpy = "*"
+pandas = "*"
+geopandas = "*"
+xarray = "*"
+rioxarray = "*"
+rasterio = "*"
+fiona = "*"
+shapely = ">=2.0"
+scipy = "*"
+scikit-learn = "*"
+xgboost = "*"
+lightgbm = "*"
+matplotlib = "*"
+cartopy = "*"
+pyproj = "*"
+pystac-client = "*"
+planetary-computer = "*"
+jupyter = "*"
+jupyterlab = "*"
+dask = "*"
+netcdf4 = "*"
+h5py = "*"
+pyarrow = "*"
+tqdm = "*"
+requests = "*"
+richdem = "*"
+
+[pypi-dependencies]
+dataretrieval = "*"
+pykrige = "*"
+verde = "*"
+mapie = "*"
+hsclient = "*"
+
+[tasks]
+data = "python -m src.data.download_nwis --start-date 2000-01-01 --output-dir data/raw/nwis"
+qc = "python -m src.data.qc_nwis --input-dir data/raw/nwis --output data/processed/nwis_gwlevels_monthly.parquet"
+eda = "jupyter nbconvert --execute notebooks/01_eda.ipynb --to html"
+lab = "jupyter lab"
+clean = "rm -f data/processed/nwis_gwlevels_monthly.parquet data/processed/nwis_sites_clean.parquet data/processed/qc_report.json"
