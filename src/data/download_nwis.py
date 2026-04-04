@@ -76,6 +76,19 @@ _PAGE_SIZE = 1000
 MAX_RETRIES = 3
 RETRY_DELAY_SEC = 30
 
+# Retry configuration (applies to 429, Timeout, and ConnectionError)
+_MAX_RETRIES_PER_REQUEST = 6
+# Base delay for exponential backoff (seconds); doubles each attempt, capped at 5 min
+_BACKOFF_BASE_SEC = 15.0
+# Seconds to sleep between batches (polite baseline)
+_INTER_BATCH_SLEEP_SEC = 2.0
+# Request timeouts: (connect_timeout_s, read_timeout_s)
+# Read timeout fires if no data arrives for this many seconds (not total duration).
+# A shorter read timeout surfaces stalled connections quickly instead of hanging silently.
+_REQUEST_TIMEOUT = (10, 60)
+# Log batch progress every N batches (set to 0 to disable)
+_LOG_BATCH_EVERY = 25
+
 # Map new API qualifier strings → legacy lev_status_cd single-letter codes.
 # Keys are lower-cased versions of qualifier values returned by the OGC API.
 # Values of "" mean "valid/static" and are kept by qc_nwis.py's filter.
@@ -125,6 +138,87 @@ def save_checkpoint(log_path: Path, log: dict) -> None:
         json.dump(log, f, indent=2)
 
 
+def _get_with_backoff(
+    session: requests.Session,
+    url: str,
+    params: dict | None,
+    max_retries: int = _MAX_RETRIES_PER_REQUEST,
+) -> requests.Response:
+    """
+    GET request with exponential backoff for transient failures.
+
+    Retries on:
+    - HTTP 429 Too Many Requests (respects ``Retry-After`` header)
+    - HTTP 503 Service Unavailable
+    - ``requests.Timeout`` (connect or read stall)
+    - ``requests.ConnectionError`` (network drop, DNS failure)
+
+    All other 4xx/5xx HTTP errors are raised immediately.
+
+    Parameters
+    ----------
+    session:
+        Shared requests.Session.
+    url:
+        Request URL.
+    params:
+        Query parameters (passed only on the first request; pagination URLs are
+        already fully qualified).
+    max_retries:
+        Maximum number of retries before re-raising.
+
+    Returns
+    -------
+    requests.Response with a 2xx status code.
+    """
+    delay = _BACKOFF_BASE_SEC
+    last_exc: Exception | None = None
+    for attempt in range(max_retries + 1):
+        try:
+            resp = session.get(url, params=params, timeout=_REQUEST_TIMEOUT)
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            last_exc = exc
+            if attempt < max_retries:
+                wait = delay
+                logger.warning(
+                    f"  {type(exc).__name__} — waiting {wait:.0f}s then retrying "
+                    f"(attempt {attempt + 1}/{max_retries}) …"
+                )
+                time.sleep(wait)
+                delay = min(delay * 2, 300.0)
+                continue
+            raise
+
+        # Handle retryable HTTP status codes
+        if resp.status_code in (429, 503):
+            retry_after = resp.headers.get("Retry-After")
+            if retry_after is not None:
+                try:
+                    wait = float(retry_after)
+                except ValueError:
+                    wait = delay
+            else:
+                wait = delay
+            if attempt < max_retries:
+                label = "429 Too Many Requests" if resp.status_code == 429 else "503 Service Unavailable"
+                logger.warning(
+                    f"  {label} — waiting {wait:.0f}s then retrying "
+                    f"(attempt {attempt + 1}/{max_retries}) …"
+                )
+                time.sleep(wait)
+                delay = min(delay * 2, 300.0)
+                continue
+            resp.raise_for_status()
+
+        resp.raise_for_status()
+        return resp
+
+    # Raise the last network error if all retries were connection/timeout failures
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("Exceeded retry limit")  # unreachable
+
+
 def _fetch_gw_levels_for_sites(
     site_nos: list[str],
     start_date: str,
@@ -165,8 +259,7 @@ def _fetch_gw_levels_for_sites(
     params: dict | None = base_params
 
     while url is not None:
-        resp = session.get(url, params=params, timeout=120)
-        resp.raise_for_status()
+        resp = _get_with_backoff(session, url, params)
         payload = resp.json()
 
         for feat in payload.get("features", []):
@@ -271,13 +364,20 @@ def download_state_gwlevels(
             try:
                 recs = _fetch_gw_levels_for_sites(batch, start_date, session, api_key)
                 all_records.extend(recs)
-            except requests.HTTPError as e:
-                logger.warning(f"  HTTP error on batch {batch_idx + 1}/{n_batches}: {e}")
+            except (requests.HTTPError, requests.Timeout, requests.ConnectionError) as e:
+                logger.warning(f"  Skipping batch {batch_idx + 1}/{n_batches} after retries: {e}")
             except Exception as e:
                 logger.warning(f"  Error on batch {batch_idx + 1}/{n_batches}: {e}")
+            # Per-batch progress heartbeat so long states don't appear frozen
+            is_last = batch_idx == n_batches - 1
+            if _LOG_BATCH_EVERY > 0 and (batch_idx % _LOG_BATCH_EVERY == 0 or is_last):
+                logger.info(
+                    f"  [{state_abbr}] batch {batch_idx + 1}/{n_batches} "
+                    f"— {len(all_records):,} records so far"
+                )
             # Polite delay between batches to respect API rate limits
-            if batch_idx < n_batches - 1:
-                time.sleep(1)
+            if not is_last:
+                time.sleep(_INTER_BATCH_SLEEP_SEC)
 
     n_levels = len(all_records)
     if n_levels > 0:
@@ -295,15 +395,36 @@ def download_state_gwlevels(
     }
 
 
-def run_download(start_date: str, output_dir: Path) -> None:
-    """Download NWIS GW data for all CONUS states with checkpointing."""
+def run_download(start_date: str, output_dir: Path, states: list[str] | None = None) -> None:
+    """Download NWIS GW data for all CONUS states (or a subset) with checkpointing.
+
+    Parameters
+    ----------
+    start_date:
+        ISO date string, e.g. "2000-01-01".
+    output_dir:
+        Directory to write per-state parquets and download_log.json.
+    states:
+        Optional list of state abbreviations (e.g. ["WA", "OR"]).  When
+        provided, only these states are downloaded; all others are skipped.
+        Already-completed states are still skipped via the checkpoint.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     log_path = output_dir / "download_log.json"
     log = load_checkpoint(log_path)
 
+    # Normalise requested state list
+    if states:
+        unknown = [s for s in states if s.upper() not in CONUS_STATES]
+        if unknown:
+            raise ValueError(f"Unknown state abbreviation(s): {unknown}. Valid: {sorted(CONUS_STATES)}")
+        states_universe = {s.upper(): CONUS_STATES[s.upper()] for s in states}
+    else:
+        states_universe = CONUS_STATES
+
     states_todo = [
         (abbr, fips)
-        for abbr, fips in sorted(CONUS_STATES.items())
+        for abbr, fips in sorted(states_universe.items())
         if abbr not in log["completed_states"]
     ]
 
@@ -373,8 +494,16 @@ def main():
         default=Path("data/raw/nwis"),
         help="Output directory (default: data/raw/nwis)",
     )
+    parser.add_argument(
+        "--states",
+        nargs="+",
+        metavar="STATE",
+        default=None,
+        help="One or more state abbreviations to download (e.g. WA OR CA). "
+             "Omit to download all CONUS states.",
+    )
     args = parser.parse_args()
-    run_download(args.start_date, args.output_dir)
+    run_download(args.start_date, args.output_dir, states=args.states)
 
 
 if __name__ == "__main__":

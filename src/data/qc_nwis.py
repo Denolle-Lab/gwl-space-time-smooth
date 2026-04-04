@@ -69,21 +69,51 @@ MIN_COVERAGE_FRACTION = 0.10
 MAX_GAP_MONTHS_FLAG = 36
 
 
-def load_raw_data(input_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Load and concatenate all state-level raw parquet files."""
+def load_raw_data(
+    input_dir: Path,
+    states: list[str] | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Load and concatenate all state-level raw parquet files.
+
+    Parameters
+    ----------
+    input_dir:
+        Directory that holds ``<STATE>_gwlevels.parquet`` / ``<STATE>_sites.parquet``.
+    states:
+        Optional list of 2-letter state abbreviations (e.g. ``['WA', 'OR']``).
+        If provided, only files for those states are loaded.
+    """
     gw_files = sorted(input_dir.glob("*_gwlevels.parquet"))
     site_files = sorted(input_dir.glob("*_sites.parquet"))
 
-    if not gw_files:
-        raise FileNotFoundError(f"No *_gwlevels.parquet files found in {input_dir}")
+    if states is not None:
+        states_upper = {s.upper() for s in states}
+        gw_files = [f for f in gw_files if f.stem.replace("_gwlevels", "").upper() in states_upper]
+        site_files = [f for f in site_files if f.stem.replace("_sites", "").upper() in states_upper]
 
-    logger.info(f"Loading GW levels from {len(gw_files)} state files...")
-    dfs_gw = [pd.read_parquet(f) for f in gw_files]
+    if not gw_files:
+        raise FileNotFoundError(
+            f"No *_gwlevels.parquet files found in {input_dir}"
+            + (f" for states {states}" if states else "")
+        )
+
+    logger.info(f"Loading GW levels from {len(gw_files)} state file(s)...")
+    dfs_gw = []
+    for f in gw_files:
+        state_abbr = f.stem.replace("_gwlevels", "").upper()
+        df = pd.read_parquet(f)
+        df["state"] = state_abbr
+        dfs_gw.append(df)
     df_gw = pd.concat(dfs_gw, ignore_index=True)
     logger.info(f"  → {len(df_gw):,} total raw GW level records")
 
-    logger.info(f"Loading site metadata from {len(site_files)} state files...")
-    dfs_sites = [pd.read_parquet(f) for f in site_files]
+    logger.info(f"Loading site metadata from {len(site_files)} state file(s)...")
+    dfs_sites = []
+    for f in site_files:
+        state_abbr = f.stem.replace("_sites", "").upper()
+        df = pd.read_parquet(f)
+        df["state"] = state_abbr
+        dfs_sites.append(df)
     df_sites = pd.concat(dfs_sites, ignore_index=True)
     # Deduplicate sites (same well can appear in multiple queries)
     df_sites = df_sites.drop_duplicates(subset=["site_no"], keep="first")
@@ -178,6 +208,11 @@ def qc_filter(
     for col in ["lat", "lon", "alt_ft", "well_depth_ft"]:
         if col in df_sites_slim.columns:
             df_sites_slim[col] = pd.to_numeric(df_sites_slim[col], errors="coerce")
+
+    # Drop any lat/lon columns already in df_gw (from OGC API download) to avoid
+    # column-suffix collisions after the merge; the authoritative coordinates come
+    # from the site-metadata table (dec_lat_va / dec_long_va).
+    df_gw = df_gw.drop(columns=[c for c in ("lat", "lon") if c in df_gw.columns])
 
     df = df_gw.merge(df_sites_slim, on="site_no", how="left")
     n_no_site = df["lat"].isna().sum()
@@ -274,6 +309,8 @@ def aggregate_monthly(df: pd.DataFrame) -> pd.DataFrame:
     }
     if "aquifer_cd" in df.columns:
         agg_kwargs["aquifer_cd"] = ("aquifer_cd", "first")
+    if "state" in df.columns:
+        agg_kwargs["state"] = ("state", "first")
 
     monthly = (
         df.groupby(["site_no", "year", "month"])
@@ -317,6 +354,8 @@ def build_clean_sites(df_monthly: pd.DataFrame) -> pd.DataFrame:
         "well_depth_m": ("well_depth_m", "first"),
         "is_deep_well": ("is_deep_well", "first"),
     }
+    if "state" in df_monthly.columns:
+        agg_kwargs["state"] = ("state", "first")
     if "aquifer_cd" in df_monthly.columns:
         agg_kwargs["aquifer_cd"] = ("aquifer_cd", "first")
 
@@ -369,6 +408,13 @@ def main():
         help="Output path for monthly parquet",
     )
     parser.add_argument(
+        "--states",
+        nargs="+",
+        metavar="STATE",
+        default=None,
+        help="Two-letter state abbreviations to include (e.g. WA OR ID). Default: all states.",
+    )
+    parser.add_argument(
         "--min-obs",
         type=int,
         default=MIN_OBS_PER_SITE,
@@ -379,7 +425,7 @@ def main():
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
     # Load
-    df_gw, df_sites = load_raw_data(args.input_dir)
+    df_gw, df_sites = load_raw_data(args.input_dir, states=args.states)
 
     # QC
     df_clean, qc_report = qc_filter(df_gw, df_sites, min_obs=args.min_obs)

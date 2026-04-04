@@ -1,0 +1,16 @@
+{
+  "raw_records": 67571,
+  "raw_sites": 84943,
+  "dropped_bad_status": 4398,
+  "dropped_no_date": 0,
+  "dropped_no_level": 2,
+  "dropped_extreme_negative": 2,
+  "dropped_no_coordinates": 0,
+  "dropped_ngvd29": 26783,
+  "flagged_deep_wells": 2399,
+  "sites_missing_altitude": 0,
+  "dropped_sparse_sites": 2897,
+  "dropped_sparse_records": 5442,
+  "clean_records": 30944,
+  "clean_sites": 863
+}

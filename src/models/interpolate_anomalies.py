@@ -169,9 +169,13 @@ def _krige_month(
     grid_y_flat: np.ndarray,
     variograms: dict[str, list],
     nst_pool: QuantileTransformer,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
     """
     Ordinary-krige one month's anomaly field onto the CONUS grid.
+
+    Propagates kriging variance (from ``okrige``) through the inverse NST
+    to estimate
+    per-cell temporal kriging uncertainty σ_anomaly(x, y, t).
 
     Parameters
     ----------
@@ -182,11 +186,12 @@ def _krige_month(
     variograms:
         Per-HUC-2 variogram lists.
     nst_pool:
-        NST transformer fitted on pooled anomalies (for consistent NST/inverse-NST).
+        NST transformer fitted on pooled anomalies.
 
     Returns
     -------
-    np.ndarray, shape (n_cells,), NaN where not interpolated.
+    anomaly : np.ndarray, shape (n_cells,) — interpolated anomaly (m), NaN where not interpolated.
+    krige_std : np.ndarray, shape (n_cells,) — σ from SGS realisations (m), NaN where not interpolated.
     """
     try:
         import gstatsim as gs
@@ -194,6 +199,7 @@ def _krige_month(
         raise ImportError("gstatsim is required. Run `pixi install`.") from exc
 
     out = np.full(len(grid_x_flat), np.nan, dtype=np.float64)
+    out_std = np.full(len(grid_x_flat), np.nan, dtype=np.float64)
 
     df_month = df_month.copy()
     df_month["Nanom"] = nst_pool.transform(df_month["anomaly_wte_m"].values.reshape(-1, 1)).ravel()
@@ -215,7 +221,7 @@ def _krige_month(
         Pred_grid = np.column_stack([grid_x_flat[cell_mask], grid_y_flat[cell_mask]])
 
         try:
-            est_N, _ = gs.Interpolation.okrige(
+            est_N, var_ok = gs.Interpolation.okrige(
                 Pred_grid,
                 region_wells[["X", "Y", "Nanom"]],
                 "X", "Y", "Nanom",
@@ -227,11 +233,19 @@ def _krige_month(
             logger.debug(f"  HUC-2 {huc} okrige failed: {exc}")
             continue
 
-        # Inverse NST
+        # Inverse NST for the mean estimate
         anom_vals = nst_pool.inverse_transform(est_N.reshape(-1, 1)).ravel()
         out[cell_mask] = anom_vals
 
-    return out
+        # Propagate kriging variance to original units via ±1σ in NST space.
+        # okrige returns var_ok = kriging variance (NST space); ±sqrt(var) bounds
+        # are inversely transformed to give the asymmetric 1σ interval.
+        std_N = np.sqrt(np.maximum(var_ok, 0.0))
+        p84 = nst_pool.inverse_transform((est_N + std_N).reshape(-1, 1)).ravel()
+        p16 = nst_pool.inverse_transform((est_N - std_N).reshape(-1, 1)).ravel()
+        out_std[cell_mask] = np.abs(p84 - p16) / 2.0
+
+    return out, out_std
 
 
 def save_zarr(
@@ -322,6 +336,7 @@ def main() -> None:  # noqa: C901
     logger.info(f"Processing {n_times} months …")
 
     anomaly_cube = np.full((n_times, grid.height, grid.width), np.nan, dtype=np.float32)
+    krige_std_cube = np.full((n_times, grid.height, grid.width), np.nan, dtype=np.float32)
     skipped_months: list[str] = []
     site_counts: dict[str, int] = {}
 
@@ -338,7 +353,7 @@ def main() -> None:  # noqa: C901
 
         site_counts[date_str] = n_sites
 
-        anomaly_flat = _krige_month(
+        anomaly_flat, krige_std_flat = _krige_month(
             df_t,
             grid_x_flat,
             grid_y_flat,
@@ -346,6 +361,7 @@ def main() -> None:  # noqa: C901
             nst_pool,
         )
         anomaly_cube[t_idx] = anomaly_flat.reshape(grid.height, grid.width).astype(np.float32)
+        krige_std_cube[t_idx] = krige_std_flat.reshape(grid.height, grid.width).astype(np.float32)
 
         if (t_idx + 1) % 12 == 0 or t_idx == n_times - 1:
             logger.info(f"  Progress: {t_idx + 1}/{n_times} months  (current: {date_str}, {n_sites} sites)")
@@ -372,6 +388,12 @@ def main() -> None:  # noqa: C901
         dtw_cube, sorted_dates, grid.transform, grid.width, grid.height,
         args.output_dir / "gwl_dtw.zarr",
         long_name="Depth to groundwater (positive = below surface)",
+        units="m",
+    )
+    save_zarr(
+        krige_std_cube, sorted_dates, grid.transform, grid.width, grid.height,
+        args.output_dir / "gwl_kriging_std.zarr",
+        long_name="Temporal kriging uncertainty \u03c3_anomaly (1 std, monthly SGS spread)",
         units="m",
     )
 

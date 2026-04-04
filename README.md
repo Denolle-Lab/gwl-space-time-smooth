@@ -98,7 +98,37 @@ pixi run lab       # launch JupyterLab
 pixi shell         # activate the environment in a shell
 ```
 
-### 2. Pipeline
+### 2. USGS API key (required for `make data`)
+
+`make data` calls the [USGS Water Data OGC API](https://api.waterdata.usgs.gov/).
+Anonymous requests are rate-limited to roughly 1 request/second; at CONUS scale
+(~1,800 batches) this triggers `429 Too Many Requests` errors mid-download.
+A free API key raises the limit significantly and is **strongly recommended**.
+
+**Getting a key (2 minutes):**
+
+1. Go to <https://api.waterdata.usgs.gov/signup/>
+2. Fill in your name and email address — no institution required.
+3. You will receive the key immediately by email (subject line: *Your USGS Water Data API Key*).
+
+**Using the key:**
+
+```bash
+export USGS_API_KEY=your_key_here   # add to ~/.zshrc or ~/.bashrc to persist
+make data
+```
+
+The script reads `USGS_API_KEY` from the environment and passes it as a query
+parameter on every request.  If the variable is unset the script falls back to
+anonymous access with automatic exponential-backoff retry (up to 6 retries per
+batch, starting at 15 s and doubling each time), but the download will be
+significantly slower and may still hit the anonymous concurrency limit.
+
+> **Note**: The download is checkpointed per state in `data/raw/nwis/download_log.json`.
+> If it is interrupted (rate-limited or otherwise), just re-run `make data` and it
+> will resume from where it left off — already-completed states are skipped.
+
+### 3. Pipeline
 
 Run targets in order. Each target is idempotent (safe to re-run; skips already-done work
 where possible).

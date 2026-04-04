@@ -1,28 +1,55 @@
 """
-Interpolate the spatial baseline water table elevation (WTE) using co-kriging
+Interpolate the spatial baseline water table elevation (WTE) via co-kriging
 with the MERIT Hydro DEM as a secondary variable (Markov Model 1).
 
-Pipeline
---------
-1.  Load usable wells (``~is_sparse_timeseries & ~has_long_gap``) from
-    ``nwis_sites_clean.parquet``; project to EPSG:5070.
-2.  Normal Score Transform (NST) on per-site long-term median WTE.
-3.  Sample DEM elevation at each well; NST(DEM); compute MM1 correlation ρ₁₂.
-4.  Fit experimental isotropic variogram (skgstat) per HUC-2 region.
-5.  Co-krige with DEM secondary (MM1) per HUC-2 patch; stitch to CONUS.
-6.  Inverse NST; apply 50 km well-density mask.
-7.  Compute SGS uncertainty: run ``cosim_mm1`` for N realisations; per-cell σ.
-8.  Write outputs:  baseline_wte_m.tif, baseline_dtw_m.tif,
-                    baseline_std_m.tif, well_density_mask.tif
+Two operating modes
+-------------------
+DEM-only (default)
+    NST(WTE) co-kriged against NST(DEM); same as original implementation.
 
-Usage:
+EDK — External Drift Kriging with HydroGEN physics prior
+    Activated by supplying ``--hydrogen-wtd``.  The Ma 2025 median WTD grid
+    is used as a physics prior:
+
+    WTE_prior(site) = DEM(site) − Ma2025_DTW(site)
+    r(site)         = obs_WTE(site) − WTE_prior(site)      ← residual
+
+    Residuals are NST-transformed and then co-kriged with DEM (MM1).
+    The kriged residual field is added back to the continuous WTE_prior grid:
+
+    baseline_wte(x,y) = (DEM(x,y) − Ma2025_DTW(x,y)) + kriged_residual(x,y)
+
+    SGS realisations are computed on residuals; their spread gives σ_EDK(x,y).
+
+Pipeline steps
+--------------
+1.  Load usable wells; project to EPSG:5070.
+2.  [EDK] Sample Ma2025 WTD at well locations; compute WTE residuals.
+    [DEM] Use obs_WTE directly.
+3.  NST on the fitting target (residuals or WTE).
+4.  Sample DEM at wells; NST(DEM); MM1 correlation ρ₁₂.
+5.  Fit per-HUC-2 variogram on NST-target via skgstat.
+6.  Co-krige NST-target with DEM secondary (MM1) per HUC-2 patch.
+7.  SGS ensemble (N realisations) for σ_EDK or σ_DEM.
+8.  Inverse NST; add residuals back to WTE_prior if EDK.
+9.  Apply 50 km well-density mask.
+10. Write: baseline_wte_m.tif, baseline_dtw_m.tif,
+           baseline_kriging_std_m.tif, well_density_mask.tif
+
+Usage (EDK):
+    python -m src.models.interpolate_baseline \\
+        --sites data/processed/nwis_sites_clean.parquet \\
+        --dem data/raw/dem/merit_hydro_1km_5070.tif \\
+        --hydrogen-wtd data/processed/hydrogen_wtd_prior_1km.tif \\
+        --output-dir data/processed
+
+Usage (DEM-only, original mode):
     python -m src.models.interpolate_baseline \\
         --sites data/processed/nwis_sites_clean.parquet \\
         --dem data/raw/dem/merit_hydro_1km_5070.tif \\
         --output-dir data/processed
 
-Assumptions and limitations are documented in docs/assumptions.md (A-series)
-and docs/limitations.md (L-series).
+Assumptions and limitations: docs/assumptions.md (A-series) / docs/limitations.md (L-series).
 """
 
 from __future__ import annotations
@@ -225,6 +252,77 @@ def _sample_dem(dem_path: Path, x: np.ndarray, y: np.ndarray) -> np.ndarray:
     return sample_dem_at_points(dem_path, x, y)
 
 
+def sample_raster_at_points(
+    raster_path: Path,
+    x: np.ndarray,
+    y: np.ndarray,
+) -> np.ndarray:
+    """
+    Sample any float32 EPSG:5070 raster at point coordinates.
+
+    Parameters
+    ----------
+    raster_path:
+        GeoTIFF in EPSG:5070.
+    x, y:
+        1-D arrays of EPSG:5070 coordinates.
+
+    Returns
+    -------
+    np.ndarray, shape (n,), float32 — nodata/out-of-bounds → NaN.
+    """
+    with rasterio.open(raster_path) as src:
+        nd = src.nodata if src.nodata is not None else -9999.0
+        coords = list(zip(x.tolist(), y.tolist()))
+        values = np.array(
+            [v[0] for v in src.sample(coords, indexes=1)],
+            dtype=np.float32,
+        )
+    values[values == nd] = np.nan
+    return values
+
+
+def compute_edk_residuals(
+    obs_wte_m: np.ndarray,
+    dem_at_wells: np.ndarray,
+    hydrogen_dtw_at_wells: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Compute the EDK residual at each well.
+
+    WTE_prior(site) = DEM(site) − Ma2025_DTW(site)
+    residual(site)  = obs_WTE(site) − WTE_prior(site)
+
+    Parameters
+    ----------
+    obs_wte_m:
+        Observed long-term median WTE at each well (m NAVD88).
+    dem_at_wells:
+        DEM elevation at each well (m NAVD88).
+    hydrogen_dtw_at_wells:
+        Ma 2025 HydroGEN WTD at each well (m, positive = below surface).
+
+    Returns
+    -------
+    wte_prior : np.ndarray — physics-model WTE at each well (m NAVD88)
+    residual  : np.ndarray — obs_WTE − WTE_prior (m); NaN where prior is NaN
+    """
+    wte_prior = dem_at_wells - hydrogen_dtw_at_wells  # NaN where H2 is NaN
+    residual = obs_wte_m - wte_prior
+    n_valid = np.isfinite(residual).sum()
+    n_total = len(residual)
+    logger.info(
+        f"EDK residuals: {n_valid:,}/{n_total:,} wells have valid HydroGEN prior; "
+        f"residual mean={np.nanmean(residual):.2f} m  std={np.nanstd(residual):.2f} m"
+    )
+    if n_valid < n_total * 0.5:
+        logger.warning(
+            f"Only {n_valid}/{n_total} wells overlap with the HydroGEN grid — "
+            "check that hydrogen_wtd_prior_1km.tif covers the study region."
+        )
+    return wte_prior, residual
+
+
 def _build_prediction_grid_for_region(
     grid_x: np.ndarray,
     grid_y: np.ndarray,
@@ -314,7 +412,7 @@ def run_cokrige_region(
     # --- SGS realisations for uncertainty ---
     realisations_N = []
     for _ in range(n_sgs):
-        sim_N, _ = gs.Interpolation.cosim_mm1(
+        sim_N = gs.Interpolation.cosim_mm1(
             Pred_grid,
             df_primary, "X", "Y", "Nwte",
             df_secondary, "X", "Y", "Ndem",
@@ -393,15 +491,34 @@ def save_geotiff(array: np.ndarray, transform: rasterio.transform.Affine, path: 
 
 
 def main() -> None:  # noqa: C901 (complexity OK for pipeline entry point)
-    parser = argparse.ArgumentParser(description="Interpolate spatial WTE baseline via co-kriging MM1 + DEM")
+    parser = argparse.ArgumentParser(
+        description="Interpolate spatial WTE baseline. EDK mode activated by --hydrogen-wtd.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("--sites", type=Path, default=Path("data/processed/nwis_sites_clean.parquet"))
     parser.add_argument("--dem", type=Path, default=Path("data/raw/dem/merit_hydro_1km_5070.tif"))
+    parser.add_argument(
+        "--hydrogen-wtd",
+        type=Path,
+        default=None,
+        help=(
+            "Path to hydrogen_wtd_prior_1km.tif (Ma 2025 WTD, EPSG:5070). "
+            "When supplied, runs EDK mode: co-krige residuals = obs_WTE − WTE_prior. "
+            "When absent, falls back to DEM-only co-kriging of raw WTE (original mode)."
+        ),
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("data/processed"))
     parser.add_argument("--n-sgs", type=int, default=N_SGS_REALISATIONS, help="SGS realisations for uncertainty")
     args = parser.parse_args()
 
+    edk_mode = args.hydrogen_wtd is not None
+    logger.info(f"Mode: {'EDK (HydroGEN physics prior)' if edk_mode else 'DEM-only co-kriging'}")
+
     # ---- 0. Validate inputs ----
-    for p in [args.sites, args.dem]:
+    required = [args.sites, args.dem]
+    if edk_mode:
+        required.append(args.hydrogen_wtd)
+    for p in required:
         if not p.exists():
             raise FileNotFoundError(f"Required input not found: {p}")
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -419,29 +536,65 @@ def main() -> None:  # noqa: C901 (complexity OK for pipeline entry point)
     grid_y_flat = grid_yy.ravel()
     dem_flat = dem_arr.ravel()
 
+    # ---- 1b. [EDK] Load HydroGEN WTD grid ----
+    if edk_mode:
+        with rasterio.open(args.hydrogen_wtd) as src:
+            h2_dtw_arr = src.read(1).astype(np.float32)
+            h2_nodata = src.nodata if src.nodata is not None else -9999.0
+        h2_dtw_arr[h2_dtw_arr == h2_nodata] = np.nan
+        h2_dtw_flat = h2_dtw_arr.ravel()
+        # WTE_prior grid = DEM − Ma2025_DTW
+        h2_wte_flat = dem_flat - h2_dtw_flat
+        logger.info(f"HydroGEN WTD prior loaded: {args.hydrogen_wtd.name}")
+    else:
+        h2_dtw_arr = None
+        h2_wte_flat = None
+
     # ---- 2. Load usable wells ----
     df_wells = load_usable_sites(args.sites)
 
-    # ---- 3. NST on WTE ----
-    nst_wte, nwte = _fit_nst(df_wells["median_wte_m"].values)
-    df_wells = df_wells.copy()
-    df_wells["Nwte"] = nwte
-    logger.info("NST(WTE) fitted")
-
-    # ---- 4. Sample DEM at wells; NST on DEM ----
+    # ---- 3. Determine fitting target: residuals (EDK) or raw WTE (DEM-only) ----
+    # Sample DEM at wells first (needed for both modes)
     dem_at_wells = _sample_dem(args.dem, df_wells["X"].values, df_wells["Y"].values)
     valid_dem = np.isfinite(dem_at_wells)
     df_wells = df_wells[valid_dem].copy()
-    nst_dem, ndem_wells = _fit_nst(dem_at_wells[valid_dem])
-    df_wells["Ndem"] = ndem_wells
-    logger.info(f"DEM sampled at {valid_dem.sum():,} wells; NST(DEM) fitted")
+    dem_at_wells = dem_at_wells[valid_dem]
 
-    # ---- 5. NST(DEM) on full grid (needed for MM1 secondary) ----
+    if edk_mode:
+        h2_dtw_at_wells = sample_raster_at_points(
+            args.hydrogen_wtd, df_wells["X"].values, df_wells["Y"].values
+        )
+        wte_prior_at_wells, residuals = compute_edk_residuals(
+            df_wells["median_wte_m"].values, dem_at_wells, h2_dtw_at_wells
+        )
+        # Drop wells where HydroGEN coverage is missing
+        valid_h2 = np.isfinite(residuals)
+        df_wells = df_wells[valid_h2].copy()
+        dem_at_wells = dem_at_wells[valid_h2]
+        fitting_values = residuals[valid_h2]  # krige residuals
+        logger.info(f"EDK: {valid_h2.sum():,} wells with valid HydroGEN prior for fitting")
+    else:
+        fitting_values = df_wells["median_wte_m"].values  # krige raw WTE
+        logger.info("DEM-only: kriging raw WTE")
+
+    # ---- 4. NST on fitting target ----
+    nst_fit, n_fit = _fit_nst(fitting_values)
+    df_wells = df_wells.copy()
+    df_wells["Nfit"] = n_fit  # renamed from Nwte for clarity; column used in run_cokrige_region
+    df_wells["Nwte"] = n_fit  # run_cokrige_region expects "Nwte"
+    logger.info(f"NST({'residuals' if edk_mode else 'WTE'}) fitted")
+
+    # ---- 5. NST on DEM (secondary variable for MM1) ----
+    nst_dem, ndem_wells = _fit_nst(dem_at_wells)
+    df_wells["Ndem"] = ndem_wells
+    logger.info(f"DEM sampled at {len(df_wells):,} wells; NST(DEM) fitted")
+
+    # ---- 6. NST(DEM) on full grid (needed for MM1 secondary) ----
     valid_grid = np.isfinite(dem_flat)
     ndem_grid = np.full(len(dem_flat), np.nan, dtype=np.float64)
     ndem_grid[valid_grid] = nst_dem.transform(dem_flat[valid_grid].reshape(-1, 1)).ravel()
 
-    # ---- 6. Correlation coefficient for MM1 ----
+    # ---- 7. Correlation coefficient for MM1 ----
     rho12 = float(np.corrcoef(df_wells["Nwte"].values, df_wells["Ndem"].values)[0, 1])
     logger.info(f"MM1 correlation coefficient ρ₁₂ = {rho12:.3f}")
     if abs(rho12) < 0.3:
@@ -450,14 +603,14 @@ def main() -> None:  # noqa: C901 (complexity OK for pipeline entry point)
             "Consider ordinary kriging only."
         )
 
-    # ---- 7. Assign HUC-2 regions ----
+    # ---- 8. Assign HUC-2 regions ----
     huc2_wells = _assign_huc2_approx(df_wells["X"].values, df_wells["Y"].values)
     df_wells = df_wells.copy()
     df_wells["huc2"] = huc2_wells
     unique_hucs = sorted(set(huc2_wells))
     logger.info(f"HUC-2 regions represented: {unique_hucs}")
 
-    # ---- 8. Per-HUC-2 variogram fitting ----
+    # ---- 9. Per-HUC-2 variogram fitting ----
     variograms: dict[str, list] = {}
     for huc in unique_hucs:
         subset = df_wells[df_wells["huc2"] == huc]
@@ -481,7 +634,7 @@ def main() -> None:  # noqa: C901 (complexity OK for pipeline entry point)
         json.dump({k: v for k, v in variograms.items()}, fh, indent=2)
     logger.info(f"Variogram parameters saved: {vario_path}")
 
-    # ---- 9. Co-kriging per HUC-2 patch ----
+    # ---- 10. Co-kriging per HUC-2 patch ----
     wte_flat = np.full(len(grid_x_flat), np.nan, dtype=np.float64)
     std_flat = np.full(len(grid_x_flat), np.nan, dtype=np.float64)
 
@@ -526,7 +679,7 @@ def main() -> None:  # noqa: C901 (complexity OK for pipeline entry point)
         wte_flat[pred_df["_idx"].values] = mean_wte
         std_flat[pred_df["_idx"].values] = std_wte
 
-    # ---- 10. Well-density mask ----
+    # ---- 11. Well-density mask ----
     in_mask = build_well_density_mask(
         df_wells["X"].values, df_wells["Y"].values,
         grid_x_flat, grid_y_flat,
@@ -535,22 +688,41 @@ def main() -> None:  # noqa: C901 (complexity OK for pipeline entry point)
     std_flat[~in_mask] = np.nan
     logger.info(f"Well-density mask: {in_mask.sum():,} cells within {MASK_DISTANCE_M/1000:.0f} km of a well")
 
-    # ---- 11. Reshape and compute DTW ----
-    wte_2d = wte_flat.reshape(grid.height, grid.width).astype(np.float32)
+    # ---- 12. Reshape, optionally add back physics prior (EDK), compute DTW ----
+    kriging_flat = wte_flat  # co-kriged field (residuals in EDK mode, raw WTE in DEM mode)
+
+    if edk_mode:
+        # Add kriged residuals back to the continuous WTE_prior grid
+        # h2_wte_flat = DEM - Ma2025_DTW (computed above, NaN outside HydroGEN coverage)
+        wte_flat_final = np.where(
+            np.isfinite(h2_wte_flat) & np.isfinite(kriging_flat),
+            h2_wte_flat + kriging_flat,
+            np.nan,
+        )
+        mode_label = "edk"
+    else:
+        wte_flat_final = kriging_flat
+        mode_label = "dem_only"
+
+    wte_2d = wte_flat_final.reshape(grid.height, grid.width).astype(np.float32)
     std_2d = std_flat.reshape(grid.height, grid.width).astype(np.float32)
     mask_2d = in_mask.reshape(grid.height, grid.width)
     dtw_2d = (dem_arr - wte_2d).astype(np.float32)  # positive = water below surface
 
-    # ---- 12. Save outputs ----
+    # ---- 13. Save outputs ----
     save_geotiff(wte_2d, grid.transform, args.output_dir / "baseline_wte_m.tif")
     save_geotiff(dtw_2d, grid.transform, args.output_dir / "baseline_dtw_m.tif")
+    # Output kriging std under a unified name (whether EDK or DEM-only)
+    save_geotiff(std_2d, grid.transform, args.output_dir / "baseline_kriging_std_m.tif")
+    # Backward-compat alias
     save_geotiff(std_2d, grid.transform, args.output_dir / "baseline_std_m.tif")
     save_geotiff(
         mask_2d.astype(np.float32), grid.transform, args.output_dir / "well_density_mask.tif",
     )
 
-    # ---- 13. Summary report ----
+    # ---- 14. Summary report ----
     report = {
+        "mode": mode_label,
         "n_usable_wells": int(len(df_wells)),
         "rho12": rho12,
         "huc2_variograms": variograms,
@@ -558,6 +730,8 @@ def main() -> None:  # noqa: C901 (complexity OK for pipeline entry point)
         "masked_cells": int((~in_mask).sum()),
         "valid_cells": int(in_mask.sum()),
         "dtw_negative_fraction": float(np.nanmean(dtw_2d < 0)),
+        "edk_residual_mean_m": float(np.nanmean(fitting_values)) if edk_mode else None,
+        "edk_residual_std_m": float(np.nanstd(fitting_values)) if edk_mode else None,
     }
     report_path = args.output_dir / "baseline_report.json"
     with open(report_path, "w") as fh:

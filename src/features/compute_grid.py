@@ -187,30 +187,108 @@ def save_grid_nc(grid: GridSpec, output_path: Path) -> None:
     logger.info(f"Grid metadata saved: {output_path}  ({grid.width} × {grid.height})")
 
 
+def build_grid_from_bbox(
+    left: float,
+    bottom: float,
+    right: float,
+    top: float,
+    res_m: float = TARGET_RES_M,
+) -> GridSpec:
+    """
+    Build a GridSpec directly from EPSG:5070 bounding-box coordinates.
+
+    This does not require the DEM to be downloaded and is the preferred way to
+    define a sub-CONUS (e.g. regional pilot) grid when the full DEM mosaic is
+    not yet available.
+
+    Parameters
+    ----------
+    left, bottom, right, top:
+        Bounding box in EPSG:5070 metres (NAD83 CONUS Albers).
+    res_m:
+        Pixel resolution in metres (default: 1000 m = 1 km).
+
+    Returns
+    -------
+    GridSpec
+    """
+    from rasterio.transform import from_bounds
+
+    width = int(round((right - left) / res_m))
+    height = int(round((top - bottom) / res_m))
+    transform = from_bounds(left, bottom, right, top, width, height)
+    return GridSpec(
+        transform=transform,
+        width=width,
+        height=height,
+        crs=TARGET_CRS,
+        nodata=-9999.0,
+    )
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build canonical CONUS 1 km grid from MERIT Hydro DEM")
+    parser = argparse.ArgumentParser(
+        description="Build canonical 1 km grid from MERIT Hydro DEM or a bounding box",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  # CONUS grid from DEM\n"
+            "  python -m src.features.compute_grid --dem data/raw/dem/merit_hydro_1km_5070.tif\n\n"
+            "  # PNW regional grid from bbox (no DEM needed)\n"
+            "  python -m src.features.compute_grid \\\n"
+            "    --bbox -2334000 2467000 -1103000 2998000 --output-dir data/processed"
+        ),
+    )
     parser.add_argument(
         "--dem",
         type=Path,
-        default=Path("data/raw/dem/merit_hydro_1km_5070.tif"),
-        help="Path to MERIT Hydro 1 km EPSG:5070 DEM.",
+        default=None,
+        help="Path to MERIT Hydro 1 km EPSG:5070 DEM. Mutually exclusive with --bbox.",
+    )
+    parser.add_argument(
+        "--bbox",
+        nargs=4,
+        type=float,
+        metavar=("LEFT", "BOTTOM", "RIGHT", "TOP"),
+        default=None,
+        help=(
+            "Bounding box in EPSG:5070 metres: left bottom right top. "
+            "Use instead of --dem to build a regional grid without the full mosaic."
+        ),
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path("data/processed"),
-        help="Directory for conus_grid_1km.nc output.",
+        help="Directory for grid .nc output.",
+    )
+    parser.add_argument(
+        "--output-name",
+        type=str,
+        default=None,
+        help="Output filename (default: conus_grid_1km.nc or bbox_grid_1km.nc).",
     )
     args = parser.parse_args()
 
-    if not args.dem.exists():
-        raise FileNotFoundError(f"DEM not found: {args.dem}. Run `make dem` first.")
+    if args.dem is None and args.bbox is None:
+        parser.error("Provide either --dem or --bbox.")
+    if args.dem is not None and args.bbox is not None:
+        parser.error("--dem and --bbox are mutually exclusive.")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    grid = load_grid_spec(args.dem)
-    logger.info(f"Grid: {grid.width} × {grid.height} px at {TARGET_RES_M} m, EPSG:5070")
 
-    save_grid_nc(grid, args.output_dir / "conus_grid_1km.nc")
+    if args.dem is not None:
+        if not args.dem.exists():
+            raise FileNotFoundError(f"DEM not found: {args.dem}. Run `make dem` first.")
+        grid = load_grid_spec(args.dem)
+        out_name = args.output_name or "conus_grid_1km.nc"
+    else:
+        left, bottom, right, top = args.bbox
+        grid = build_grid_from_bbox(left, bottom, right, top)
+        out_name = args.output_name or "bbox_grid_1km.nc"
+
+    logger.info(f"Grid: {grid.width} × {grid.height} px at {TARGET_RES_M} m, EPSG:5070")
+    save_grid_nc(grid, args.output_dir / out_name)
 
 
 if __name__ == "__main__":
