@@ -426,6 +426,7 @@ def run_download(start_date: str, output_dir: Path, states: list[str] | None = N
         (abbr, fips)
         for abbr, fips in sorted(states_universe.items())
         if abbr not in log["completed_states"]
+        or not (output_dir / f"{abbr}_sites.parquet").exists()
     ]
 
     if not states_todo:
@@ -438,6 +439,9 @@ def run_download(start_date: str, output_dir: Path, states: list[str] | None = N
     )
 
     for state_abbr, state_fips in tqdm(states_todo, desc="States", unit="state"):
+        sites_path = output_dir / f"{state_abbr}_sites.parquet"
+        if state_abbr in log["completed_states"] and not sites_path.exists():
+            logger.info(f"  {state_abbr}: checkpoint entry exists but parquet missing — re-downloading")
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 summary = download_state_gwlevels(

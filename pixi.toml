@@ -34,6 +34,8 @@ pyarrow = "*"
 tqdm = "*"
 requests = "*"
 richdem = "*"
+numba = "*"
+llvmlite = "*"
 
 [pypi-dependencies]
 dataretrieval = "*"
